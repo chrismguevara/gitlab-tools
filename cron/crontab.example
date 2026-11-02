@@ -1,0 +1,22 @@
+# gitlab-tools crontab example  (crontab -e as the automation user)
+# PATH must contain glab and opencode; HOME must be the user that ran `glab auth login`
+# and `opencode providers` (or export GITLAB_TOKEN / ANTHROPIC_API_KEY in ~/.config/gitlab-tools/env).
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin:/home/bot/.local/bin
+MAILTO=bot
+GLT=/home/bot/gitlab-tools
+
+# Rebase our MRs when main moves (clean rebases cost 0 tokens)
+*/15 * * * *  $GLT/bin/glt-mr-rebase   >> $GLT/../.local/state/gitlab-tools/cron.log 2>&1
+
+# React to new review comments (1 small classifier call per MR with new comments)
+*/10 * * * *  $GLT/bin/glt-mr-comments >> $GLT/../.local/state/gitlab-tools/cron.log 2>&1
+
+# Triage failed pipelines (flaky retries free; 1 small call per real failure)
+*/20 * * * *  $GLT/bin/glt-ci-triage   >> $GLT/../.local/state/gitlab-tools/cron.log 2>&1
+
+# Draft MRs for issues labelled "opencode" (biggest spend; gate with the label)
+0 */2 * * *   $GLT/bin/glt-issue-to-mr >> $GLT/../.local/state/gitlab-tools/cron.log 2>&1
+
+# Morning digest (0 tokens)
+45 7 * * 1-5  $GLT/bin/glt-mr-digest   >> $GLT/../.local/state/gitlab-tools/cron.log 2>&1

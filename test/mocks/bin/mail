@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Mock `mail -s subject recipient` : appends the message to $GLT_TEST_MAILBOX
+set -u
+subject=""; while (( $# )); do case "$1" in -s) subject="$2"; shift 2 ;; *) to="$1"; shift ;; esac; done
+{ echo "----- MAIL -----"; echo "To: ${to:-?}"; echo "Subject: $subject"; echo; cat; echo; } >> "${GLT_TEST_MAILBOX:?}"

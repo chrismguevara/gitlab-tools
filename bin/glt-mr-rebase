@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# glt-mr-rebase - keep our open MRs rebased on their target branch.
+#
+#   glt-mr-rebase [--mr IID ...] [--mode plan|resolve|mail] [--dry-run] [-v]
+#
+# For each open MR we own (GLT_MR_LIST_ARGS, default --author=@me):
+#   1. zero-cost check: is origin/<target> already an ancestor of origin/<source>?
+#      yes -> nothing to do (no LLM, no push).
+#   2. git rebase locally. Clean rebase -> optional GLT_VERIFY_CMD -> push
+#      --force-with-lease. Still no LLM.
+#   3. Conflicts -> depends on --mode / GLT_REBASE_CONFLICT_MODE:
+#        mail    : abort, email the conflict hunks (no LLM)
+#        plan    : read-only opencode agent writes a resolution plan -> email  (default)
+#        resolve : opencode edits the conflicted files; script stages, continues,
+#                  verifies, pushes, replies on the MR, and emails a summary.
+#                  Any failure falls back to an email with the details.
+#   Each (MR, source sha, target sha) is attempted once; the state file prevents
+#   burning tokens on the same conflict every cron tick.
+set -euo pipefail
+SCRIPT_NAME="mr-rebase"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+
+: "${GLT_REBASE_CONFLICT_MODE:=plan}"
+: "${GLT_REBASE_LABEL:=}"                 # only MRs carrying this label (empty = all ours)
+: "${GLT_REBASE_SKIP_LABEL:=no-auto-rebase}"
+: "${GLT_REBASE_COMMENT:=1}"              # post a note on the MR after a push
+: "${GLT_MAX_CONFLICT_ROUNDS:=5}"         # a rebase can stop once per replayed commit
+: "${GLT_MAX_CONTEXT_BYTES:=60000}"       # cap on conflict text handed to the model
+: "${GLT_MAIL_ON_SUCCESS:=0}"
+
+MODE="$GLT_REBASE_CONFLICT_MODE"; ONLY=()
+while (( $# )); do
+  case "$1" in
+    --mr) ONLY+=("$2"); shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --dry-run) GLT_DRY_RUN=1; shift ;;
+    -v|--verbose) GLT_VERBOSE=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[[ "$MODE" =~ ^(plan|resolve|mail)$ ]] || die "--mode must be plan|resolve|mail"
+require_cmd glab git jq flock
+acquire_lock rebase
+ensure_repo
+DIR="$(repo_dir)"
+git -C "$DIR" config merge.conflictStyle zdiff3 2>/dev/null || true
+
+# Conflict context for the model/email: bounded, only what matters.
+conflict_context() {     # conflict_context <src> <tgt>
+  local src="$1" tgt="$2"
+  echo "## Upstream commits being rebased onto ($tgt, newest first)"
+  git -C "$DIR" log --oneline --no-decorate "origin/$src..origin/$tgt" | head -30
+  echo; echo "## Commit being replayed"
+  git -C "$DIR" log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || true
+  echo; echo "## Conflicted files"
+  git -C "$DIR" diff --name-only --diff-filter=U
+  echo; echo "## Conflict hunks (zdiff3 markers; '|||||||' = common ancestor)"
+  git -C "$DIR" diff --diff-filter=U | head -c "$GLT_MAX_CONTEXT_BYTES"
+}
+
+attempt_key() { echo "$1:$2:$3"; }
+
+handle_mr() {
+  local mr="$1" iid src tgt title url
+  iid="$(jq -r .iid <<<"$mr")"; src="$(jq -r .source_branch <<<"$mr")"
+  tgt="$(jq -r .target_branch <<<"$mr")"; title="$(jq -r .title <<<"$mr")"; url="$(jq -r .web_url <<<"$mr")"
+
+  if [[ "$(jq -r .fork <<<"$mr")" = true ]]; then dbg "!$iid: from a fork, skipping"; return; fi
+  if [[ -n "$GLT_REBASE_LABEL" ]] && ! has_label "$mr" "$GLT_REBASE_LABEL"; then dbg "!$iid: no $GLT_REBASE_LABEL label"; return; fi
+  if has_label "$mr" "$GLT_REBASE_SKIP_LABEL"; then dbg "!$iid: has $GLT_REBASE_SKIP_LABEL"; return; fi
+  if ! git -C "$DIR" rev-parse -q --verify "origin/$src" >/dev/null; then warn "!$iid: origin/$src not found"; return; fi
+
+  local src_sha tgt_sha behind
+  src_sha="$(git -C "$DIR" rev-parse "origin/$src")"; tgt_sha="$(git -C "$DIR" rev-parse "origin/$tgt")"
+  behind="$(git -C "$DIR" rev-list --count "origin/$src..origin/$tgt")"
+  if [[ "$behind" = 0 ]]; then dbg "!$iid: up to date with $tgt"; return; fi
+
+  local key; key="$(attempt_key "$iid" "$src_sha" "$tgt_sha")"
+  if state_has rebase.attempted "$key"; then dbg "!$iid: already attempted for this sha pair"; return; fi
+
+  log "!$iid '$title': $src is $behind commit(s) behind $tgt; rebasing"
+  checkout_branch "$src"
+  if git -C "$DIR" rebase --quiet "origin/$tgt" >/dev/null 2>&1; then
+    finish_rebase "$iid" "$src" "$src_sha" "$url" "clean rebase onto $tgt ($behind upstream commits)"
+    return
+  fi
+
+  # --- conflicts ---------------------------------------------------------
+  local ctx; ctx="$(conflict_context "$src" "$tgt")"
+  state_add rebase.attempted "$key"
+  case "$MODE" in
+    mail)    git -C "$DIR" rebase --abort; mail_conflict "$iid" "$title" "$url" "$src" "$tgt" "$ctx" "" ;;
+    plan)    plan_conflict "$iid" "$title" "$url" "$src" "$tgt" "$ctx" ;;
+    resolve) resolve_conflict "$iid" "$title" "$url" "$src" "$tgt" "$src_sha" "$ctx" ;;
+  esac
+}
+
+finish_rebase() {        # finish_rebase <iid> <src> <old_sha> <url> <how>
+  local iid="$1" src="$2" old_sha="$3" url="$4" how="$5"
+  if ! run_verify; then
+    warn "!$iid: verify failed after rebase; not pushing"
+    git -C "$DIR" reset --quiet --hard "origin/$src"
+    { echo "MR: $url"; echo "Rebase succeeded locally ($how) but GLT_VERIFY_CMD failed, so nothing was pushed."; echo
+      echo "Last 80 lines of verify output:"; tail -80 "$GLT_LOG_DIR/verify.last.log"; } | send_mail "!$iid rebase: verification failed"
+    return
+  fi
+  git_push "--force-with-lease=$src:$old_sha" "$src"
+  log "!$iid: pushed rebased $src ($how)"
+  [[ "$GLT_REBASE_COMMENT" = 1 ]] && gl_mr_note "$iid" "🤖 Rebased \`$src\` onto the target branch: $how. Previous head: ${old_sha:0:10}." || true
+  if [[ "$GLT_MAIL_ON_SUCCESS" = 1 ]]; then printf 'MR: %s\n%s\n' "$url" "$how" | send_mail "!$iid rebased ($how)"; fi
+}
+
+mail_conflict() {        # mail_conflict <iid> <title> <url> <src> <tgt> <ctx> <extra>
+  { echo "MR: $3"; echo "Title: $2"; echo "Rebase of $4 onto $5 has conflicts. Nothing was pushed."; echo
+    [[ -n "$7" ]] && { echo "$7"; echo; }
+    echo "Reproduce locally:"; echo "  git fetch origin && git checkout $4 && git rebase origin/$5"; echo
+    echo "$6"; } | send_mail "!$1 rebase conflicts ($4 -> $5)"
+}
+
+plan_conflict() {        # read-only agent writes a plan, then we abort the rebase
+  local iid="$1" title="$2" url="$3" src="$4" tgt="$5" ctx="$6" plan=""
+  local pf="$GLT_LOG_DIR/prompt.rebase-plan.$iid.md"
+  { echo "Write a resolution plan for these git rebase conflicts. The repository is checked out with the rebase stopped, so you may read the files."
+    echo; echo "MR !$iid: $title"; echo "Branch: $src rebased onto $tgt"; echo; echo "$ctx"; } > "$pf"
+  if budget_ok; then plan="$(oc_run glt-planner "$DIR" "$pf" || true)"; fi
+  git -C "$DIR" rebase --abort
+  mail_conflict "$iid" "$title" "$url" "$src" "$tgt" "$ctx" "${plan:+## Proposed plan (opencode)
+$plan}"
+}
+
+resolve_conflict() {     # agent edits files; we drive the rebase loop
+  local iid="$1" title="$2" url="$3" src="$4" tgt="$5" old_sha="$6" ctx="$7"
+  local round=0 notes="" out files=()
+  while (( round < GLT_MAX_CONFLICT_ROUNDS )); do
+    round=$(( round + 1 ))
+    mapfile -t files < <(git -C "$DIR" diff --name-only --diff-filter=U)
+    (( ${#files[@]} == 0 )) && break
+    local pf="$GLT_LOG_DIR/prompt.rebase-resolve.$iid.$round.md"
+    { echo "Resolve the conflicts in the files listed below (round $round of a git rebase of '$src' onto '$tgt')."
+      echo; echo "MR !$iid: $title"; echo; echo "$ctx"; } > "$pf"
+    if ! budget_ok; then warn "!$iid: token budget exhausted"; break; fi
+    if ! out="$(oc_run glt-resolver "$DIR" "$pf")"; then warn "!$iid: resolver run failed"; break; fi
+    notes+="Round $round:
+$out
+"
+    if grep -q 'UNRESOLVED: [^n]' <<<"$out" || git -C "$DIR" grep -q -E '^(<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|)' -- "${files[@]}"; then
+      warn "!$iid: agent left conflicts unresolved"; break
+    fi
+    git -C "$DIR" add -- "${files[@]}"
+    if GIT_EDITOR=true git -C "$DIR" rebase --continue >/dev/null 2>&1; then
+      break    # rebase finished
+    fi
+    ctx="$(conflict_context "$src" "$tgt")"   # stopped again on a later commit
+  done
+
+  if [[ -n "$(git -C "$DIR" diff --name-only --diff-filter=U)" ]] || [[ -d "$DIR/.git/rebase-merge" ]]; then
+    git -C "$DIR" rebase --abort 2>/dev/null || true
+    mail_conflict "$iid" "$title" "$url" "$src" "$tgt" "$ctx" "Automatic resolution did not complete (rounds: $round).
+${notes:+Agent notes:
+$notes}"
+    return
+  fi
+  if ! run_verify; then
+    git -C "$DIR" reset --quiet --hard "origin/$src"
+    { echo "MR: $url"; echo "Conflicts were resolved by opencode but GLT_VERIFY_CMD failed; nothing pushed."; echo
+      echo "Agent notes:"; echo "$notes"; echo; echo "Verify output (tail):"; tail -80 "$GLT_LOG_DIR/verify.last.log"; } \
+      | send_mail "!$iid rebase: resolved but verification failed"
+    return
+  fi
+  git_push "--force-with-lease=$src:$old_sha" "$src"
+  log "!$iid: pushed conflict-resolved rebase"
+  [[ "$GLT_REBASE_COMMENT" = 1 ]] && gl_mr_note "$iid" "🤖 Rebased \`$src\` onto \`$tgt\`; conflicts were resolved automatically, please review:
+
+$notes
+Previous head: ${old_sha:0:10}." || true
+  { echo "MR: $url"; echo "Rebased $src onto $tgt with automatic conflict resolution and pushed."; echo; echo "$notes"; } \
+    | send_mail "!$iid rebased with conflict resolution - please review"
+}
+
+while IFS= read -r mr; do [[ -n "$mr" ]] && handle_mr "$mr"; done < <(mr_candidates "${ONLY[@]}")
+log "done; tokens used this run: $TOKENS_USED"

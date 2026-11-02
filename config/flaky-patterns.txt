@@ -1,0 +1,14 @@
+# One extended regex per line (grep -E -i). A failed job whose log tail matches
+# any of these is retried instead of triaged by the model.
+Connection (reset by peer|timed out|refused)
+ETIMEDOUT|ECONNRESET|EAI_AGAIN
+429 Too Many Requests
+502 Bad Gateway|503 Service Unavailable|504 Gateway Time-?out
+TLS handshake timeout
+Could not resolve host
+Runner system failure|runner_system_failure
+ERROR: Job failed \(system failure\)
+docker: Error response from daemon
+No space left on device
+Temporary failure in name resolution
+unexpected EOF|early EOF

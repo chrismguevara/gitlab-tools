@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# glt-mr-comments - act on new review comments on our open MRs.
+#
+#   glt-mr-comments [--mr IID ...] [--dry-run] [-v]
+#
+# For every unresolved discussion whose latest note is not ours:
+#   0. zero-LLM: GitLab ```suggestion``` blocks are applied through the API;
+#      "LGTM"-style notes are ignored; quick actions (/label ...) are ignored.
+#   1. one cheap classifier call per MR (small model, no tools) labels the rest:
+#        minor_fix   -> opencode fixer edits, script verifies/commits/pushes, replies in thread
+#        substantial -> email: what is being asked and what it would involve
+#        question    -> email with a drafted reply + the command to post it
+#        no_action   -> remembered, nothing else
+#   2. one email per MR per run aggregating everything that needs a human.
+# Every (discussion, latest note) pair is handled once (state file), so a
+# thread is only revisited when the reviewer adds a new note.
+set -euo pipefail
+SCRIPT_NAME="mr-comments"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+
+: "${GLT_COMMENTS_HEURISTIC_ONLY:=0}"   # 1 = never call the classifier (?=question, else substantial)
+: "${GLT_MAX_NOTES_PER_MR:=10}"          # classified per run; the rest wait for the next tick
+: "${GLT_MAX_FIXES_PER_RUN:=5}"
+: "${GLT_MAX_FILES_PER_FIX:=4}"          # bigger diffs are reverted and escalated
+: "${GLT_NOTE_MAX_CHARS:=1500}"
+: "${GLT_AUTO_RESOLVE:=0}"               # resolve the thread after a fix (default: let the reviewer)
+: "${GLT_REPLY_ON_FIX:=1}"
+: "${GLT_ACK_SUBSTANTIAL:=0}"            # post "acknowledged" on substantial requests
+: "${GLT_APPLY_SUGGESTIONS:=1}"
+
+ONLY=()
+while (( $# )); do
+  case "$1" in
+    --mr) ONLY+=("$2"); shift 2 ;;
+    --dry-run) GLT_DRY_RUN=1; shift ;;
+    -v|--verbose) GLT_VERBOSE=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+require_cmd glab git jq flock python3
+acquire_lock comments
+ME="$(gl_me)"
+ensure_repo
+DIR="$(repo_dir)"
+FIXES_DONE=0
+
+# Pending discussions of an MR -> JSON lines {did, note_id, author, body, path, line, suggestions, url}
+pending_discussions() {
+  local iid="$1"
+  gl_api_paginated "projects/:id/merge_requests/$iid/discussions?per_page=100" \
+  | jq -c --arg me "$ME" --argjson max "$GLT_NOTE_MAX_CHARS" '
+      .[] | select(.notes[0].system == false)
+      | select((.notes[0].resolvable | not) or (.notes[0].resolved == false))
+      | (.notes | map(select(.system == false)) | last) as $n
+      | select($n.author.username != $me)
+      | select(($n.body | test("^/")) | not)                 # quick actions
+      | {did: .id, note_id: $n.id, author: $n.author.username, created: $n.created_at,
+         body: ($n.body[:$max]), path: ($n.position.new_path // $n.position.old_path // null),
+         line: ($n.position.new_line // $n.position.old_line // null),
+         suggestions: ($n.suggestions // []),
+         first_body: (.notes[0].body[:$max]), n_notes: (.notes | length)}'
+}
+
+is_lgtm() { grep -qiE '^\s*(lgtm|looks good( to me)?|approved?|nice|thanks?|ship it|:thumbsup:|👍|\+1)\s*[.!]*\s*$' <<<"$1"; }
+
+apply_suggestion() {     # apply_suggestion <iid> <did> <suggestion_id>
+  gl_api PUT "projects/:id/suggestions/$3/apply" -f "commit_message=Apply review suggestion (thread $2)" >/dev/null
+}
+
+classify() {             # classify <iid> <title> <jsonl-of-items>  -> JSON array on stdout
+  local iid="$1" title="$2" items="$3"
+  if [[ "$GLT_COMMENTS_HEURISTIC_ONLY" = 1 ]] || ! budget_ok; then heuristic_classify "$items"; return; fi
+  local pf="$GLT_LOG_DIR/prompt.classify.$iid.md"
+  { echo "Classify the following review comments on MR !$iid \"$title\"."; echo
+    while IFS= read -r it; do
+      [[ -z "$it" ]] && continue
+      local id path line; id="$(jq -r .note_id <<<"$it")"; path="$(jq -r '.path // ""' <<<"$it")"; line="$(jq -r '.line // ""' <<<"$it")"
+      echo "### Comment id=$id by @$(jq -r .author <<<"$it")${path:+ on $path${line:+:$line}}"
+      if [[ "$(jq -r .n_notes <<<"$it")" -gt 1 ]]; then echo "Thread opener: $(jq -r .first_body <<<"$it" | head -c 400)"; echo; echo "Latest note:"; fi
+      jq -r .body <<<"$it"; echo
+      if [[ -n "$path" && -n "$line" ]]; then echo '```'; code_context "$path" "$line" 8; echo '```'; fi
+      echo
+    done <<<"$items"
+  } > "$pf"
+  local out json
+  out="$(oc_run glt-classifier "$DIR" "$pf" || true)"
+  if json="$(extract_json <<<"$out")" && jq -e 'type=="array"' <<<"$json" >/dev/null; then echo "$json"
+  else warn "!$iid: classifier output unusable; falling back to heuristics"; heuristic_classify "$items"; fi
+}
+heuristic_classify() {
+  jq -sc 'map({id: (.note_id|tostring), kind: (if (.body|test("\\?\\s*$")) then "question" else "substantial" end),
+               summary: (.body | gsub("\n"; " ") | .[:70]), needed: "(heuristic classification; no model consulted)", reply: ""})' <<<"$1"
+}
+
+fix_one() {              # fix_one <iid> <src> <item-json> <summary>  -> prints commit sha or returns 1
+  local iid="$1" src="$2" it="$3" summary="$4" path line pf out
+  path="$(jq -r '.path // ""' <<<"$it")"; line="$(jq -r '.line // ""' <<<"$it")"
+  pf="$GLT_LOG_DIR/prompt.fix.$iid.$(jq -r .note_id <<<"$it").md"
+  { echo "Apply this review comment from @$(jq -r .author <<<"$it") on MR !$iid."
+    [[ -n "$path" ]] && echo "File: $path${line:+ (line $line)}"
+    echo; echo "Comment:"; jq -r .body <<<"$it"; echo
+    if [[ -n "$path" && -n "$line" ]]; then echo "Context:"; echo '```'; code_context "$path" "$line" 12; echo '```'; fi
+    echo; echo "Classifier summary: $summary"; } > "$pf"
+  out="$(oc_run glt-fixer "$DIR" "$pf")" || { git -C "$DIR" reset -q --hard; git -C "$DIR" clean -qfd; return 1; }
+  if grep -q '^ESCALATE:' <<<"$out"; then git -C "$DIR" reset -q --hard; git -C "$DIR" clean -qfd; echo "$out"; return 2; fi
+  local changed; changed="$(git -C "$DIR" status --porcelain | wc -l)"
+  if (( changed == 0 )); then warn "!$iid: fixer made no changes"; return 1; fi
+  if (( changed > GLT_MAX_FILES_PER_FIX )); then
+    warn "!$iid: fixer touched $changed files (> $GLT_MAX_FILES_PER_FIX); reverting"
+    git -C "$DIR" reset -q --hard; git -C "$DIR" clean -qfd; echo "ESCALATE: automatic fix touched $changed files; reverted."; return 2
+  fi
+  if ! run_verify; then
+    warn "!$iid: verify failed after fix; reverting"; git -C "$DIR" reset -q --hard; git -C "$DIR" clean -qfd
+    echo "ESCALATE: fix applied but GLT_VERIFY_CMD failed:"; tail -40 "$GLT_LOG_DIR/verify.last.log"; return 2
+  fi
+  local subject; subject="$(tail -1 <<<"$out" | head -c 70)"; [[ -z "$subject" ]] && subject="$summary"
+  git -C "$DIR" add -A
+  git -C "$DIR" commit -q -m "$subject" -m "Addresses review comment by @$(jq -r .author <<<"$it") on !$iid (note $(jq -r .note_id <<<"$it"))." -m "Automated with opencode via gitlab-tools."
+  git -C "$DIR" rev-parse --short HEAD
+}
+
+handle_mr() {
+  local mr="$1" iid src title url
+  iid="$(jq -r .iid <<<"$mr")"; src="$(jq -r .source_branch <<<"$mr")"; title="$(jq -r .title <<<"$mr")"; url="$(jq -r .web_url <<<"$mr")"
+  [[ "$(jq -r .fork <<<"$mr")" = true ]] && { dbg "!$iid: fork, skipping"; return; }
+
+  local pending="" it key
+  while IFS= read -r it; do
+    [[ -z "$it" ]] && continue
+    key="$iid:$(jq -r .did <<<"$it"):$(jq -r .note_id <<<"$it")"
+    state_has comments.seen "$key" && continue
+    pending+="$it"$'\n'
+  done < <(pending_discussions "$iid")
+  [[ -z "$pending" ]] && { dbg "!$iid: nothing new"; return; }
+
+  local to_classify="" sec_fixed="" sec_human="" sec_q="" n=0 pushed=0
+  git -C "$DIR" rev-parse -q --verify "origin/$src" >/dev/null && checkout_branch "$src"
+
+  # ---- zero-LLM pass --------------------------------------------------------
+  while IFS= read -r it; do
+    [[ -z "$it" ]] && continue
+    key="$iid:$(jq -r .did <<<"$it"):$(jq -r .note_id <<<"$it")"
+    local body; body="$(jq -r .body <<<"$it")"
+    if is_lgtm "$body"; then state_add comments.seen "$key"; continue; fi
+    local sid; sid="$(jq -r '[.suggestions[]? | select(.applied==false and .appliable==true)] | .[0].id // empty' <<<"$it")"
+    if [[ "$GLT_APPLY_SUGGESTIONS" = 1 && -n "$sid" ]]; then
+      if apply_suggestion "$iid" "$(jq -r .did <<<"$it")" "$sid"; then
+        log "!$iid: applied suggestion $sid"; sec_fixed+="- applied reviewer suggestion in $(jq -r '.path // "?"' <<<"$it") (no model used)"$'\n'
+        state_add comments.seen "$key"; continue
+      fi
+    fi
+    (( n < GLT_MAX_NOTES_PER_MR )) || continue
+    n=$(( n + 1 )); to_classify+="$it"$'\n'
+  done <<<"$pending"
+  [[ -z "$to_classify" ]] && { [[ -n "$sec_fixed" ]] && send_report "$iid" "$title" "$url" "$sec_fixed" "" ""; return; }
+
+  # ---- classify (one call) ------------------------------------------------------
+  local classes; classes="$(classify "$iid" "$title" "$to_classify")"
+  git -C "$DIR" rev-parse -q --verify "origin/$src" >/dev/null && checkout_branch "$src"   # fresh tree again
+
+  while IFS= read -r it; do
+    [[ -z "$it" ]] && continue
+    local nid did author path line c kind summary needed reply
+    nid="$(jq -r .note_id <<<"$it")"; did="$(jq -r .did <<<"$it")"; author="$(jq -r .author <<<"$it")"
+    path="$(jq -r '.path // ""' <<<"$it")"; line="$(jq -r '.line // ""' <<<"$it")"
+    key="$iid:$did:$nid"
+    c="$(jq -c --arg id "$nid" 'map(select((.id|tostring)==$id)) | .[0] // {kind:"substantial",summary:"(unclassified)",needed:"",reply:""}' <<<"$classes")"
+    kind="$(jq -r .kind <<<"$c")"; summary="$(jq -r '.summary // ""' <<<"$c")"; needed="$(jq -r '.needed // ""' <<<"$c")"; reply="$(jq -r '.reply // ""' <<<"$c")"
+    local where="${path:+$path${line:+:$line}}"; where="${where:-(general)}"
+    log "!$iid note $nid by @$author -> $kind: $summary"
+    case "$kind" in
+      no_action) ;;
+      minor_fix)
+        if (( FIXES_DONE >= GLT_MAX_FIXES_PER_RUN )) || ! budget_ok; then warn "fix limit/budget reached; deferring note $nid"; continue; fi
+        FIXES_DONE=$(( FIXES_DONE + 1 ))
+        local res rc=0; res="$(fix_one "$iid" "$src" "$it" "$summary")" || rc=$?
+        if [[ $rc -eq 0 ]]; then
+          sec_fixed+="- $where: $summary (commit $res)"$'\n'; pushed=1
+          if [[ "$GLT_REPLY_ON_FIX" = 1 ]]; then PENDING_REPLIES+=("$did|$res|$summary"); fi
+        elif [[ $rc -eq 2 ]]; then sec_human+="- $where by @$author: $summary"$'\n'"  $(sed 's/^ESCALATE: //' <<<"$res" | head -c 600)"$'\n'"  $(jq -r .body <<<"$it" | head -c 300)"$'\n'
+        else sec_human+="- $where by @$author: $summary (automatic fix failed, see logs)"$'\n'; fi ;;
+      question)
+        sec_q+="- $where by @$author asks: $(jq -r .body <<<"$it" | tr '\n' ' ' | head -c 400)"$'\n'
+        sec_q+="  Suggested reply: ${reply:-(none drafted)}"$'\n'
+        sec_q+="  Post it:  glt-reply $iid $did <<'EOF'"$'\n'"  ${reply:-...}"$'\n'"  EOF"$'\n\n' ;;
+      *)  # substantial / unknown
+        sec_human+="- $where by @$author: $summary"$'\n'"  Needs: ${needed:-?}"$'\n'"  Comment: $(jq -r .body <<<"$it" | tr '\n' ' ' | head -c 400)"$'\n'
+        [[ "$GLT_ACK_SUBSTANTIAL" = 1 ]] && gl_discussion_reply "$iid" "$did" "🤖 Acknowledged - this needs a human; the author has been notified." || true ;;
+    esac
+    state_add comments.seen "$key"
+  done <<<"$to_classify"
+
+  if (( pushed )); then
+    git_push "$src"
+    local sha; local r
+    for r in "${PENDING_REPLIES[@]:-}"; do
+      [[ -z "$r" ]] && continue
+      IFS='|' read -r did sha summary <<<"$r"
+      gl_discussion_reply "$iid" "$did" "🤖 Addressed in $sha: $summary" || true
+      [[ "$GLT_AUTO_RESOLVE" = 1 ]] && gl_discussion_resolve "$iid" "$did" || true
+    done
+    PENDING_REPLIES=()
+  fi
+  send_report "$iid" "$title" "$url" "$sec_fixed" "$sec_human" "$sec_q"
+}
+
+send_report() {          # send_report <iid> <title> <url> <fixed> <human> <questions>
+  [[ -z "$4$5$6" ]] && return 0
+  { echo "MR !$1: $2"; echo "$3"; echo
+    [[ -n "$5" ]] && { echo "== Needs your decision (substantial or escalated) =="; echo "$5"; }
+    [[ -n "$6" ]] && { echo "== Questions awaiting your reply =="; echo "$6"; }
+    [[ -n "$4" ]] && { echo "== Auto-fixed and pushed (please review) =="; echo "$4"; }
+    echo; echo "tokens used this run so far: $TOKENS_USED"; } | send_mail "!$1 review comments: ${5:+action needed}${6:+ questions}${4:+ auto-fixes}"
+}
+
+PENDING_REPLIES=()
+while IFS= read -r mr; do [[ -n "$mr" ]] && handle_mr "$mr"; done < <(mr_candidates "${ONLY[@]}")
+log "done; fixes=$FIXES_DONE tokens=$TOKENS_USED"

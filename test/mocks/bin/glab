@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Mock glab for tests. Fixtures: $GLT_TEST_FIXTURES/<name>.json ; calls logged to $GLT_TEST_CALLS.
+# API GET paths map to fixtures by stripping "projects/<encoded>/" and the query string,
+# then replacing "/" with "_":  projects/x%2Fy/merge_requests/1/discussions -> merge_requests_1_discussions.json
+set -u
+FIX="${GLT_TEST_FIXTURES:?}"; CALLS="${GLT_TEST_CALLS:?}"
+log() { printf '%s\n' "$*" >> "$CALLS"; }
+case "${1:-}" in
+  --version) echo "glab mock"; exit 0 ;;
+  auth) log "auth $*"; echo "Logged in to gitlab.example as bot"; exit 0 ;;
+  api)
+    shift; method=GET; path=""; fields=(); paginate=0
+    while (( $# )); do
+      case "$1" in
+        -X|--method) method="$2"; shift 2 ;;
+        --paginate) paginate=1; shift ;;
+        -f|--raw-field|-F|--field) fields+=("$2"); shift 2 ;;
+        -*) shift ;;
+        *) path="$1"; shift ;;
+      esac
+    done
+    log "api $method $path ${fields[*]:-}"
+    name="${path%%\?*}"; name="${name#projects/}"; name="${name#*/}"; [[ "$path" == projects/* && "$name" == "$path" ]] && name=""
+    [[ "${path%%\?*}" =~ ^projects/[^/]+$ ]] && name="project"
+    name="${name//\//_}"
+    if [[ "$method" = GET ]]; then
+      if [[ -f "$FIX/$name.txt" ]]; then cat "$FIX/$name.txt"
+      elif [[ -f "$FIX/$name.json" ]]; then cat "$FIX/$name.json"
+      else echo "mock glab: no fixture for $name ($path)" >&2; echo '{}'; fi
+    else
+      echo '{"id": 999, "iid": 42, "web_url": "https://gitlab.example/group/proj/-/merge_requests/42"}'
+    fi ;;
+  mr)
+    log "mr $*"
+    case "${2:-}" in
+      list) cat "$FIX/mr_list.json" ;;
+      diff) [[ -f "$FIX/mr_diff.txt" ]] && cat "$FIX/mr_diff.txt" ;;
+      *) echo '{}' ;;
+    esac ;;
+  issue) log "issue $*"; cat "$FIX/issues.json" 2>/dev/null || echo '[]' ;;
+  *) log "other $*"; exit 0 ;;
+esac

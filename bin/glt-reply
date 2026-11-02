@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# glt-reply <mr-iid> <discussion-id> [--resolve]   (reply body on stdin)
+# Posts a reply into an MR discussion thread. Used from the emails sent by
+# glt-mr-comments, so answering a reviewer is a paste away.
+set -euo pipefail
+SCRIPT_NAME="reply"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+[[ $# -ge 2 ]] || { echo "usage: glt-reply <iid> <discussion-id> [--resolve] < reply.txt" >&2; exit 2; }
+body="$(cat)"; [[ -n "$body" ]] || die "empty reply body"
+gl_discussion_reply "$1" "$2" "$body"
+[[ "${3:-}" = --resolve ]] && gl_discussion_resolve "$1" "$2"
+log "replied on !$1 discussion $2"

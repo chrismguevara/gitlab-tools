@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# glt-mr-digest - daily email: what needs my attention on GitLab. Zero LLM by
+# default; GLT_DIGEST_LLM=1 adds a 5-bullet "do this first" summary (small model).
+#
+#   glt-mr-digest [--dry-run] [-v]
+set -euo pipefail
+SCRIPT_NAME="mr-digest"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+: "${GLT_STALE_DAYS:=7}"
+: "${GLT_DIGEST_LLM:=0}"
+while (( $# )); do case "$1" in --dry-run) GLT_DRY_RUN=1;; -v) GLT_VERBOSE=1;; -h|--help) sed -n '2,6p' "$0"; exit 0;; *) die "unknown argument $1";; esac; shift; done
+require_cmd glab jq
+ME="$(gl_me)"
+stale_before="$(date -u -d "-$GLT_STALE_DAYS days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"${GLT_STALE_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)"
+
+fmt() { jq -r '.[] | "- !\(.iid) \(.title[:70])  [\(.detailed_merge_status // .merge_status)] pipeline=\(.head_pipeline.status // "none") updated=\(.updated_at[:10])\n    \(.web_url)"'; }
+
+to_review="$(glab mr list -F json --per-page 100 --reviewer=@me 2>/dev/null || echo '[]')"
+mine="$(glab mr list -F json --per-page 100 --author=@me 2>/dev/null || echo '[]')"
+body="$(
+  echo "GitLab digest for @$ME on $GLT_PROJECT ($(date -u +%F))"; echo
+  echo "== Waiting for my review ($(jq length <<<"$to_review")) =="; fmt <<<"$to_review"; echo
+  echo "== My MRs ready to merge =="; jq '[.[] | select((.detailed_merge_status // .merge_status) == "mergeable" and (.head_pipeline.status // "success") == "success" and .draft == false)]' <<<"$mine" | fmt
+  echo "   merge with: glab mr merge <iid> -R $GLT_PROJECT"; echo
+  echo "== My MRs blocked =="; jq '[.[] | select(.has_conflicts == true or (.head_pipeline.status // "") == "failed" or .blocking_discussions_resolved == false)]' <<<"$mine" \
+    | jq -r '.[] | "- !\(.iid) \(.title[:60]): " + ([ (if .has_conflicts then "conflicts" else empty end), (if (.head_pipeline.status // "")=="failed" then "pipeline failed" else empty end), (if .blocking_discussions_resolved==false then "unresolved threads" else empty end) ] | join(", ")) + "\n    \(.web_url)"'; echo
+  echo "== My stale MRs (no update since $GLT_STALE_DAYS days) =="; jq --arg t "$stale_before" '[.[] | select(.updated_at < $t)]' <<<"$mine" | fmt; echo
+)"
+if [[ "$GLT_DIGEST_LLM" = 1 ]] && budget_ok; then
+  pf="$GLT_LOG_DIR/prompt.digest.md"; { echo "From this digest, list at most 5 bullets of what to do first today, most important first. Plain text."; echo; echo "$body"; } > "$pf"
+  summary="$(oc_run glt-summarizer "$GLT_WORKDIR" "$pf" || true)"
+  [[ -n "$summary" ]] && body="== Do first ==
+$summary
+
+$body"
+fi
+printf '%s\n' "$body" | send_mail "daily MR digest"
+log "digest sent to $GLT_MAIL_TO (tokens=$TOKENS_USED)"

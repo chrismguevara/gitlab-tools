@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# glt-doctor - check that everything the cron jobs need is in place.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GLT_CONFIG="${GLT_CONFIG:-$HOME/.config/gitlab-tools/env}"
+ok() { printf '  [ok]   %s\n' "$*"; }; bad() { printf '  [FAIL] %s\n' "$*"; RC=1; }; warn() { printf '  [warn] %s\n' "$*"; }
+RC=0
+echo "gitlab-tools doctor ($ROOT)"
+# shellcheck disable=SC1090
+[[ -f "$GLT_CONFIG" ]] && { ok "config $GLT_CONFIG"; source "$GLT_CONFIG"; } || bad "config file missing: $GLT_CONFIG (copy config/env.example)"
+for c in glab git jq flock python3 timeout; do command -v "$c" >/dev/null && ok "$c: $(command -v "$c")" || bad "$c not installed"; done
+OC="${GLT_OPENCODE_BIN:-opencode}"
+command -v "$OC" >/dev/null && ok "opencode: $("$OC" --version 2>/dev/null)" || bad "opencode not installed (npm i -g opencode-ai)"
+if command -v mail >/dev/null || command -v mailx >/dev/null || command -v sendmail >/dev/null || [[ -n "${GLT_MAIL_CMD:-}" ]]; then ok "mail transport present"; else warn "no mail/mailx/sendmail: mails will be written to the state outbox"; fi
+[[ -n "${GLT_PROJECT:-}" ]] && ok "GLT_PROJECT=$GLT_PROJECT" || bad "GLT_PROJECT not set"
+if [[ -n "${GITLAB_TOKEN:-}" ]]; then ok "GITLAB_TOKEN set (${#GITLAB_TOKEN} chars)"; else warn "GITLAB_TOKEN not set; relying on 'glab auth login' state"; fi
+if out="$(glab auth status 2>&1)"; then ok "glab auth: $(grep -m1 -E 'Logged in|Token' <<<"$out" | sed 's/^ *//')"; else bad "glab auth status failed: $(head -2 <<<"$out" | tr '\n' ' ')"; fi
+if [[ -n "${GLT_PROJECT:-}" ]] && glab api "projects/$(printf '%s' "$GLT_PROJECT" | jq -sRr @uri)" >/dev/null 2>&1; then ok "project reachable via API"; else bad "cannot read project $GLT_PROJECT via API"; fi
+CFG="${GLT_OPENCODE_CONFIG:-$ROOT/opencode/opencode.json}"
+jq -e . "$CFG" >/dev/null 2>&1 && ok "opencode config parses: $CFG" || bad "opencode config invalid: $CFG"
+if command -v "$OC" >/dev/null; then
+  if agents="$(cd "$ROOT" && OPENCODE_CONFIG="$CFG" timeout 60 "$OC" agent list 2>/dev/null </dev/null)"; then
+    for a in glt-classifier glt-fixer glt-resolver glt-planner glt-summarizer glt-implementer; do grep -q "^$a" <<<"$agents" && ok "agent $a" || bad "agent $a missing from opencode agent list"; done
+  else warn "could not run 'opencode agent list' (model/provider not configured yet?)"; fi
+  jq -r '.model, .small_model' "$CFG" | sed 's/^/  model: /'
+  warn "make sure the provider for those models has credentials: 'opencode providers' / env var (e.g. ANTHROPIC_API_KEY) available to cron"
+fi
+exit $RC

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# glt-ci-triage - deal with failed pipelines on our open MRs.
+#
+#   glt-ci-triage [--mr IID ...] [--dry-run] [-v]
+#
+# For each MR whose head pipeline failed (and was not triaged before):
+#   1. zero-LLM: jobs failed for infrastructure reasons (failure_reason =
+#      runner_system_failure/stuck_or_timeout_failure/...) or whose log matches
+#      config/flaky-patterns.txt are retried through the API (max GLT_CI_MAX_RETRIES
+#      per job name per MR). Nothing else happens.
+#   2. otherwise one small-model call summarises the failed job logs (tail only)
+#      into category / root cause / suggested fix -> email.
+#   3. optional (GLT_CI_AUTOFIX=1): for category lint|build judged auto_fixable
+#      the fixer agent attempts a change; verify -> commit -> push -> email.
+set -euo pipefail
+SCRIPT_NAME="ci-triage"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+
+: "${GLT_CI_LOG_TAIL:=150}"
+: "${GLT_CI_MAX_JOBS:=4}"
+: "${GLT_CI_MAX_RETRIES:=2}"
+: "${GLT_CI_AUTOFIX:=0}"
+: "${GLT_CI_FLAKY_PATTERNS:=$GLT_ROOT/config/flaky-patterns.txt}"
+: "${GLT_CI_INFRA_REASONS:=runner_system_failure stuck_or_timeout_failure scheduler_failure data_integrity_failure runner_unsupported api_failure}"
+
+ONLY=()
+while (( $# )); do
+  case "$1" in
+    --mr) ONLY+=("$2"); shift 2 ;;
+    --dry-run) GLT_DRY_RUN=1; shift ;;
+    -v|--verbose) GLT_VERBOSE=1; shift ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+require_cmd glab git jq flock python3
+acquire_lock ci-triage
+
+job_trace_tail() { gl_api GET "projects/:id/jobs/$1/trace" | strip_ansi | tail -n "$GLT_CI_LOG_TAIL"; }
+
+looks_flaky() {          # looks_flaky <failure_reason> <trace-file>
+  local reason="$1" trace="$2" r
+  for r in $GLT_CI_INFRA_REASONS; do [[ "$reason" = "$r" ]] && return 0; done
+  [[ -f "$GLT_CI_FLAKY_PATTERNS" ]] && grep -vE '^\s*(#|$)' "$GLT_CI_FLAKY_PATTERNS" | grep -qEif - "$trace"
+}
+
+retry_job() { gl_api POST "projects/:id/jobs/$1/retry" >/dev/null; }
+
+handle_mr() {
+  local mr="$1" iid title url pid pstatus
+  iid="$(jq -r .iid <<<"$mr")"; title="$(jq -r .title <<<"$mr")"; url="$(jq -r .web_url <<<"$mr")"
+  pid="$(jq -r '.head_pipeline.id // empty' <<<"$mr")"; pstatus="$(jq -r '.head_pipeline.status // empty' <<<"$mr")"
+  [[ -z "$pid" || "$pstatus" != failed ]] && { dbg "!$iid: pipeline ${pstatus:-none}"; return; }
+  state_has ci.seen "$pid" && { dbg "!$iid: pipeline $pid already triaged"; return; }
+  log "!$iid '$title': pipeline $pid failed"
+
+  local jobs; jobs="$(gl_api_paginated "projects/:id/pipelines/$pid/jobs?scope[]=failed&per_page=50" | jq -c '.[] | {id, name, stage, failure_reason, web_url, allow_failure}' | head -n "$GLT_CI_MAX_JOBS")"
+  local retried="" report="" job jid jname reason trace
+  while IFS= read -r job; do
+    [[ -z "$job" ]] && continue
+    jid="$(jq -r .id <<<"$job")"; jname="$(jq -r .name <<<"$job")"; reason="$(jq -r '.failure_reason // ""' <<<"$job")"
+    [[ "$(jq -r .allow_failure <<<"$job")" = true ]] && continue
+    trace="$GLT_LOG_DIR/trace.$pid.$jid.log"; job_trace_tail "$jid" > "$trace" || true
+    local count; count="$(state_get "ci.retries.$iid.$jname" 2>/dev/null || echo 0)"; count="${count:-0}"
+    if looks_flaky "$reason" "$trace" && (( count < GLT_CI_MAX_RETRIES )); then
+      retry_job "$jid" && { state_set "ci.retries.$iid.$jname" "$(( count + 1 ))"; retried+="- $jname (${reason:-pattern match}), retry $(( count + 1 ))/$GLT_CI_MAX_RETRIES"$'\n'; log "!$iid: retried flaky job $jname"; }
+      continue
+    fi
+    report+="### Job: $jname (stage $(jq -r .stage <<<"$job"), reason: ${reason:-n/a})"$'\n'"$(jq -r .web_url <<<"$job")"$'\n''```'$'\n'"$(tail -n 60 "$trace")"$'\n''```'$'\n\n'
+  done <<<"$jobs"
+  state_add ci.seen "$pid"
+
+  if [[ -z "$report" ]]; then
+    [[ -n "$retried" ]] && { printf 'MR: %s\nPipeline %s: flaky/infra failures were retried automatically (no model used):\n%s\n' "$url" "$pid" "$retried" | send_mail "!$iid CI: retried flaky jobs"; }
+    return
+  fi
+
+  # ---- one small-model call for the real failures -------------------------------
+  local pf="$GLT_LOG_DIR/prompt.ci.$iid.$pid.md" out json="" category="unknown" root="" fix="" autofix=false files=""
+  { echo "Triage this failed GitLab CI pipeline for MR !$iid \"$title\". Only the tail of each failed job log is included."
+    echo "Changed files in the MR:"; { glab mr diff "$iid" --raw 2>/dev/null | grep -E '^diff --git' | sed -E 's#^diff --git a/(.*) b/.*#- \1#' | head -40; } || true
+    echo; echo "$report"
+    echo 'Respond with JSON only: {"category":"test_failure|lint|build|infra|unknown","root_cause":"<1-2 sentences>","fix_suggestion":"<concrete steps>","auto_fixable":true|false,"files":["..."]}'
+    echo 'auto_fixable means: a mechanical change (formatting, lint rule, missing import, obvious compile error) confined to the listed files.'; } > "$pf"
+  if budget_ok; then out="$(oc_run glt-summarizer "$GLT_WORKDIR" "$pf" || true)"; json="$(extract_json <<<"$out" || true)"; fi
+  if [[ -n "$json" ]]; then
+    category="$(jq -r '.category // "unknown"' <<<"$json")"; root="$(jq -r '.root_cause // ""' <<<"$json")"
+    fix="$(jq -r '.fix_suggestion // ""' <<<"$json")"; autofix="$(jq -r '.auto_fixable // false' <<<"$json")"; files="$(jq -r '(.files // []) | join(", ")' <<<"$json")"
+  fi
+
+  local fixed=""
+  if [[ "$GLT_CI_AUTOFIX" = 1 && "$autofix" = true && "$category" =~ ^(lint|build)$ ]] && budget_ok; then
+    fixed="$(try_autofix "$mr" "$root" "$fix" "$files" "$report")" || fixed="(automatic fix attempted but not pushed: $fixed)"
+  fi
+
+  { echo "MR: $url"; echo "Pipeline: $pid"; echo
+    echo "Category: $category"; echo "Root cause: ${root:-model unavailable; see raw logs below}"; echo "Suggested fix: $fix"; [[ -n "$files" ]] && echo "Files: $files"
+    [[ -n "$fixed" ]] && { echo; echo "Auto-fix: $fixed"; }
+    [[ -n "$retried" ]] && { echo; echo "Retried as flaky:"; echo "$retried"; }
+    echo; echo "Raw log tails:"; echo "$report"; } | send_mail "!$iid CI failed: $category - ${root:0:60}"
+}
+
+try_autofix() {          # prints a one-line result; returns 1 when nothing was pushed
+  local mr="$1" root="$2" fix="$3" files="$4" report="$5" iid src
+  iid="$(jq -r .iid <<<"$mr")"; src="$(jq -r .source_branch <<<"$mr")"
+  [[ "$(jq -r .fork <<<"$mr")" = true ]] && { echo "MR is from a fork"; return 1; }
+  ensure_repo; local dir; dir="$(repo_dir)"; checkout_branch "$src"
+  local pf="$GLT_LOG_DIR/prompt.cifix.$iid.md"
+  { echo "CI failed on MR !$iid. Make the minimal change that fixes it."; echo "Root cause: $root"; echo "Suggested fix: $fix"; echo "Files: $files"; echo; echo "$report"; } > "$pf"
+  local out; out="$(oc_run glt-fixer "$dir" "$pf")" || { git -C "$dir" reset -q --hard; echo "fixer failed"; return 1; }
+  grep -q '^ESCALATE:' <<<"$out" && { git -C "$dir" reset -q --hard; git -C "$dir" clean -qfd; echo "$out"; return 1; }
+  [[ -z "$(git -C "$dir" status --porcelain)" ]] && { echo "no changes made"; return 1; }
+  run_verify || { git -C "$dir" reset -q --hard; git -C "$dir" clean -qfd; echo "verify failed after fix"; return 1; }
+  git -C "$dir" add -A && git -C "$dir" commit -q -m "Fix CI: $(tail -1 <<<"$out" | head -c 60)" -m "Automated with opencode via gitlab-tools (pipeline triage)."
+  local old; old="$(git -C "$dir" rev-parse "origin/$src")"
+  git_push "--force-with-lease=$src:$old" "$src"
+  echo "pushed $(git -C "$dir" rev-parse --short HEAD): $(tail -1 <<<"$out")"
+}
+
+while IFS= read -r mr; do [[ -n "$mr" ]] && handle_mr "$mr"; done < <(mr_candidates "${ONLY[@]}")
+log "done; tokens=$TOKENS_USED"

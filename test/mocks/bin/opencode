@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Mock opencode for tests. `opencode run --agent A ... < prompt`:
+#   * appends the prompt to $GLT_TEST_OC_DIR/A.prompt (with a counter in A.count)
+#   * runs $GLT_TEST_OC_DIR/A.sh in the cwd if present (simulates file edits)
+#   * prints --format json events: one text part from $GLT_TEST_OC_DIR/A.response (default "ok")
+set -u
+D="${GLT_TEST_OC_DIR:?}"
+case "${1:-}" in
+  --version) echo "mock"; exit 0 ;;
+  agent) echo "glt-classifier (primary)"; exit 0 ;;
+  run) ;;
+  *) exit 0 ;;
+esac
+shift; agent=default
+while (( $# )); do case "$1" in --agent) agent="$2"; shift 2 ;; --title|--format|--model|-m) shift 2 ;; *) shift ;; esac; done
+prompt="$(cat)"
+n=$(( $(cat "$D/$agent.count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/$agent.count"
+printf '===== call %s =====\n%s\n' "$n" "$prompt" >> "$D/$agent.prompt"
+[[ -x "$D/$agent.sh" ]] && "$D/$agent.sh" "$D/$agent.prompt" >&2
+resp="$(cat "$D/$agent.response" 2>/dev/null || echo ok)"
+[[ "${GLT_TEST_OC_FAIL:-}" = "$agent" ]] && { echo "boom" >&2; exit 1; }
+jq -nc --arg t "$resp" '{type:"step_start",part:{type:"step-start"}}, {type:"text",part:{type:"text",text:$t}}, {type:"step_finish",part:{type:"step-finish",reason:"stop",tokens:{total:1234,input:1000,output:234}}}'
